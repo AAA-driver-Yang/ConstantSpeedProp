@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProjectGuid>{9C7D38F6-4B1A-45F4-B2A8-51AF0E0DD7B3}</ProjectGuid>
+    <OutputType>Library</OutputType>
+    <RootNamespace>ConstantSpeedProp</RootNamespace>
+    <AssemblyName>ConstantSpeedProp</AssemblyName>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <FileAlignment>512</FileAlignment>
+    <LangVersion>7.3</LangVersion>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <OutputPath>bin\Debug\</OutputPath>
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <DefineConstants>DEBUG;TRACE</DefineConstants>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <OutputPath>bin\Release\</OutputPath>
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
+    <DefineConstants>TRACE</DefineConstants>
+  </PropertyGroup>
+
+  <!-- KSPDIR should point to the KSP root folder, for example: E:\KSP -->
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(KSPDIR)\KSP_x64_Data\Managed\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="UnityEngine">
+      <HintPath>$(KSPDIR)\KSP_x64_Data\Managed\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(KSPDIR)\KSP_x64_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="UnityEngine.PhysicsModule">
+      <HintPath>$(KSPDIR)\KSP_x64_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="ModuleConstantSpeedProp.cs" />
+  </ItemGroup>
+
+  <Target Name="CopyBuiltDllToPackageGameData" AfterTargets="Build">
+    <MakeDir Directories="$(MSBuildProjectDirectory)\..\..\GameData\ConstantSpeedProp\Plugins" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(MSBuildProjectDirectory)\..\..\GameData\ConstantSpeedProp\Plugins" />
+  </Target>
+
+  <Target Name="CopyBuiltDllToKspGameData" AfterTargets="Build" Condition="Exists('$(KSPDIR)\GameData')">
+    <MakeDir Directories="$(KSPDIR)\GameData\ConstantSpeedProp\Plugins" />
+    <MakeDir Directories="$(KSPDIR)\GameData\ConstantSpeedProp\Patches" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(KSPDIR)\GameData\ConstantSpeedProp\Plugins" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\..\..\GameData\ConstantSpeedProp\Patches\ConstantSpeedProp.cfg" DestinationFolder="$(KSPDIR)\GameData\ConstantSpeedProp\Patches" />
+  </Target>
+
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>
