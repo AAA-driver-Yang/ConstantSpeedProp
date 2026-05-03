@@ -101,7 +101,7 @@ A：源码编译
 
 6. 重新进入游戏，右键转子，应该看到版本号：
 
-   CSP Version: v0.3.5 FastRPM NoTakeoffHold
+   CSP Version: v3.5 FastRPM NoTakeoffHold
 
 B:直接复制ConstantSpeedProp到GameData文件夹
 
