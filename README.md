@@ -27,7 +27,7 @@ Final path:
 Kerbal Space Program/GameData/ConstantSpeedProp/Plugins/ConstantSpeedProp.dll
 Kerbal Space Program/GameData/ConstantSpeedProp/Patches/ConstantSpeedProp.cfg
 ```
-ConstantSpeedProp v3.5 FastRPM NoTakeoffHold 使用说明（中文版）
+ConstantSpeedProp v0.3.5 使用说明（中文版）
 ============================================================
 
 一、模组定位
