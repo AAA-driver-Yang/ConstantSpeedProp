@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
+using System.Text.RegularExpressions;
 using Expansions.Serenity;
 using UnityEngine;
 
@@ -9,18 +11,19 @@ namespace ConstantSpeedProp
     /// <summary>
     /// KSP1 / Breaking Ground fast constant-speed propeller governor.
     ///
-    /// v3.5 design goal:
+    /// v3.9 design goal:
     /// - Remove takeoff pitch schedule protection completely.
     /// - Remove low-throttle/low-power hold protection completely.
     /// - Make pitch response immediate and symmetric for identical rotors.
     /// - Keep RPM as the primary control objective because rotor RPM determines available shaft power.
-    /// - Keep a stall guard that can override RPM control only when measured/guard AoA exceeds the configured limit.
+    /// - Remove absolute AoA guard. Use signed AoA for positive high-AoA stall recovery.
+    /// - Add Forward Lift Guard: if KSP/DLC reports negative forward lift, coarsen pitch until forward thrust recovers.
     ///
     /// This module attaches to a ModuleRoboticServoRotor and controls directly attached ModuleControlSurface blades.
     /// </summary>
     public class ModuleConstantSpeedProp : PartModule
     {
-        private const string VersionText = "v3.5 FastRPM NoTakeoffHold";
+        private const string VersionText = "v0.3.9 ForwardLiftGuard NoAbsAoA";
 
         private ModuleRoboticServoRotor rotor;
         private readonly List<ModuleControlSurface> blades = new List<ModuleControlSurface>();
@@ -30,6 +33,8 @@ namespace ConstantSpeedProp
         private float previousError;
         private bool initializedPitch;
         private float nextBladeRefreshTime;
+        private double lastGovernorUniversalTime = -1.0;
+        private float lastGovernorRealtime = -1f;
 
         private struct AeroData
         {
@@ -37,6 +42,10 @@ namespace ConstantSpeedProp
             public float signedAverageAoa;
             public float guardAoa;
             public float averageBladeSpeed;
+            public bool hasForwardLift;
+            public float averageForwardLift;
+            public float minForwardLift;
+            public int forwardLiftSampleCount;
             public int sampleCount;
             public string source;
         }
@@ -47,6 +56,8 @@ namespace ConstantSpeedProp
             public float signedAoa;
             public float guardAoa;
             public float bladeSpeed;
+            public bool hasForwardLift;
+            public float forwardLift;
         }
 
         private Vector3 RotorAxis
@@ -134,9 +145,17 @@ namespace ConstantSpeedProp
         [UI_Toggle(scene = UI_Scene.All, disabledText = "No", enabledText = "Yes", affectSymCounterparts = UI_Scene.All)]
         public bool useDlcAeroData = true;
 
-        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "Abs AoA Guard")]
+        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "Forward Lift Guard")]
         [UI_Toggle(scene = UI_Scene.All, disabledText = "Off", enabledText = "On", affectSymCounterparts = UI_Scene.All)]
-        public bool useAbsoluteAoaLimit = true;
+        public bool forwardLiftGuardEnabled = true;
+
+        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "Negative Lift Deadband", guiUnits = " kN")]
+        [UI_FloatRange(scene = UI_Scene.All, minValue = 0f, maxValue = 20f, stepIncrement = 0.1f, affectSymCounterparts = UI_Scene.All)]
+        public float negativeForwardLiftDeadband = 0.5f;
+
+        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "Lift Recovery Rate", guiUnits = " deg/s")]
+        [UI_FloatRange(scene = UI_Scene.All, minValue = 1f, maxValue = 120f, stepIncrement = 1f, affectSymCounterparts = UI_Scene.All)]
+        public float negativeLiftRecoveryRate = 45f;
 
         [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "Invert Aero Flow")]
         [UI_Toggle(scene = UI_Scene.All, disabledText = "Off", enabledText = "On", affectSymCounterparts = UI_Scene.All)]
@@ -199,6 +218,12 @@ namespace ConstantSpeedProp
         [KSPField(isPersistant = false, guiActive = true, guiName = "Guard AoA", guiUnits = " deg", guiFormat = "F1")]
         public float guardAoaDisplay;
 
+        [KSPField(isPersistant = false, guiActive = true, guiName = "Forward Lift", guiUnits = " kN", guiFormat = "F1")]
+        public float forwardLiftDisplay;
+
+        [KSPField(isPersistant = false, guiActive = true, guiName = "Forward Lift Samples")]
+        public int forwardLiftSampleCountDisplay;
+
         [KSPField(isPersistant = false, guiActive = true, guiName = "Blade Speed", guiUnits = " m/s", guiFormat = "F1")]
         public float measuredBladeSpeedDisplay;
 
@@ -207,6 +232,9 @@ namespace ConstantSpeedProp
 
         [KSPField(isPersistant = false, guiActive = true, guiName = "Aero Samples")]
         public int aeroSampleCountDisplay;
+
+        [KSPField(isPersistant = false, guiActive = true, guiName = "Loop Source")]
+        public string loopSourceDisplay = "Not running";
 
         [KSPField(isPersistant = false, guiActive = true, guiName = "Blade Count")]
         public int bladeCountDisplay;
@@ -220,7 +248,9 @@ namespace ConstantSpeedProp
                 "rpmDeadband",
                 "antiStallEnabled",
                 "useDlcAeroData",
-                "useAbsoluteAoaLimit",
+                "forwardLiftGuardEnabled",
+                "negativeForwardLiftDeadband",
+                "negativeLiftRecoveryRate",
                 "invertAeroFlow",
                 "invertMeasuredAoaSign",
                 "targetBladeAoa",
@@ -238,9 +268,12 @@ namespace ConstantSpeedProp
                 "pitchLimitDisplay",
                 "estimatedAoaDisplay",
                 "guardAoaDisplay",
+                "forwardLiftDisplay",
+                "forwardLiftSampleCountDisplay",
                 "measuredBladeSpeedDisplay",
                 "axialAirspeedDisplay",
                 "aeroSampleCountDisplay",
+                "loopSourceDisplay",
                 "bladeCountDisplay"
             };
 
@@ -282,11 +315,21 @@ namespace ConstantSpeedProp
             feather = false;
         }
 
+        public override void OnLoad(ConfigNode node)
+        {
+            base.OnLoad(node);
+            versionDisplay = VersionText;
+            nextBladeRefreshTime = 0f;
+            initializedPitch = false;
+        }
+
         public override void OnStart(StartState state)
         {
             base.OnStart(state);
             versionDisplay = VersionText;
             ForceFieldVisibility();
+            nextBladeRefreshTime = 0f;
+            initializedPitch = false;
         }
 
         public override void OnStartFinished(StartState state)
@@ -307,25 +350,58 @@ namespace ConstantSpeedProp
             InitializePitchFromBlades();
         }
 
-        public void FixedUpdate()
+        public override void OnUpdate()
         {
-            if (!HighLogic.LoadedSceneIsFlight || FlightDriver.Pause || rotor == null)
+            base.OnUpdate();
+
+            // v3.8 watchdog: some KSP/robotics setups do not reliably execute the physics callback
+            // until the PAW has been opened. If neither fixed callback has run recently, run once
+            // from OnUpdate so the governor wakes up without the player right-clicking the rotor.
+            if (!HighLogic.LoadedSceneIsFlight || FlightDriver.Pause)
                 return;
 
-            if (Planetarium.GetUniversalTime() >= nextBladeRefreshTime)
-            {
-                RefreshBlades();
-                nextBladeRefreshTime = (float)Planetarium.GetUniversalTime() + 1f;
-            }
+            double ut = Planetarium.GetUniversalTime();
+            double maxDelay = Math.Max(0.05, TimeWarp.fixedDeltaTime * 1.5);
+            if (lastGovernorUniversalTime < 0.0 || ut - lastGovernorUniversalTime > maxDelay)
+                RunGovernorLoop("OnUpdateWatchdog", Mathf.Max(Time.deltaTime, TimeWarp.fixedDeltaTime));
+        }
 
-            currentRpmDisplay = Mathf.Abs(rotor.currentRPM);
+        public override void OnFixedUpdate()
+        {
+            base.OnFixedUpdate();
+            RunGovernorLoop("KSPOnFixedUpdate", TimeWarp.fixedDeltaTime);
+        }
+
+        public void FixedUpdate()
+        {
+            // Keep the old Unity callback too. Some KSP installs/mod stacks are more reliable with this path.
+            RunGovernorLoop("UnityFixedUpdate", TimeWarp.fixedDeltaTime);
+        }
+
+        private void RunGovernorLoop(string source, float dt)
+        {
+            if (!HighLogic.LoadedSceneIsFlight || FlightDriver.Pause)
+                return;
+
+            if (dt <= 0f)
+                dt = Mathf.Max(TimeWarp.fixedDeltaTime, 0.02f);
+
+            double ut = Planetarium.GetUniversalTime();
+            // Avoid running twice in the same physics instant when both Unity FixedUpdate and KSP OnFixedUpdate fire.
+            if (lastGovernorUniversalTime >= 0.0 && Math.Abs(ut - lastGovernorUniversalTime) < 0.000001)
+                return;
+
+            if (!EnsureRuntimeReady())
+                return;
+
+            lastGovernorUniversalTime = ut;
+            lastGovernorRealtime = Time.realtimeSinceStartup;
+            loopSourceDisplay = source;
+
+            currentRpmDisplay = GetCurrentRotorRpm();
             bladeCountDisplay = blades.Count;
 
             if (!governorEnabled || blades.Count == 0)
-                return;
-
-            float dt = TimeWarp.fixedDeltaTime;
-            if (dt <= 0f)
                 return;
 
             if (!initializedPitch)
@@ -340,6 +416,8 @@ namespace ConstantSpeedProp
             estimatedAoaDisplay = aero.signedAverageAoa;
             guardAoaDisplay = aero.guardAoa;
             measuredBladeSpeedDisplay = aero.averageBladeSpeed;
+            forwardLiftDisplay = aero.hasForwardLift ? aero.minForwardLift : 0f;
+            forwardLiftSampleCountDisplay = aero.forwardLiftSampleCount;
             aeroSampleCountDisplay = aero.sampleCount;
 
             float pitchToApply;
@@ -359,9 +437,9 @@ namespace ConstantSpeedProp
                 rpmErrorDisplay = rpmError;
                 requestedPitchRate = ComputeGovernorPitchRate(rpmError, dt);
 
-                if (antiStallEnabled && aero.valid)
+                if (antiStallEnabled && (aero.valid || aero.hasForwardLift))
                 {
-                    ApplyStallGuard(ref requestedPitchRate, aero.guardAoa);
+                    ApplyStallGuard(ref requestedPitchRate, aero);
                 }
 
                 requestedPitchRate = Mathf.Clamp(requestedPitchRate, -Mathf.Abs(pitchRateLimit), Mathf.Abs(pitchRateLimit));
@@ -386,6 +464,29 @@ namespace ConstantSpeedProp
             pitchRateCommandDisplay = requestedPitchRate;
             ApplyPitchToBlades(pitchToApply);
             commandedPitchDisplay = pitchToApply;
+        }
+
+        private bool EnsureRuntimeReady()
+        {
+            if (part == null)
+                return false;
+
+            if (rotor == null)
+                rotor = part.FindModuleImplementing<ModuleRoboticServoRotor>();
+
+            if (rotor == null)
+                return false;
+
+            if (Planetarium.GetUniversalTime() >= nextBladeRefreshTime || blades.Count == 0)
+            {
+                RefreshBlades();
+                nextBladeRefreshTime = (float)Planetarium.GetUniversalTime() + 0.5f;
+            }
+
+            if (!initializedPitch && blades.Count > 0)
+                InitializePitchFromBlades();
+
+            return blades.Count > 0 || rotor != null;
         }
 
         private float ComputeGovernorPitchRate(float rpmError, float dt)
@@ -424,14 +525,28 @@ namespace ConstantSpeedProp
             return rate;
         }
 
-        private void ApplyStallGuard(ref float requestedPitchRate, float guardAoa)
+        private void ApplyStallGuard(ref float requestedPitchRate, AeroData aero)
         {
+            // v3.9: Forward lift is now a control input. If KSP's own DLC blade panel reports
+            // negative forward lift, the propeller is effectively producing reverse thrust. In that
+            // case the controller must increase blade angle, even if the signed AoA estimator is
+            // confused by clockwise/counter-clockwise mirroring.
+            if (forwardLiftGuardEnabled && aero.hasForwardLift && aero.minForwardLift < -Mathf.Max(0f, negativeForwardLiftDeadband))
+            {
+                float deficit = -aero.minForwardLift - Mathf.Max(0f, negativeForwardLiftDeadband);
+                float severity = Mathf.Clamp01(deficit / 10f + 0.35f);
+                requestedPitchRate = Mathf.Max(requestedPitchRate, Mathf.Abs(negativeLiftRecoveryRate) * severity);
+                integralError = 0f;
+                return;
+            }
+
+            float guardAoa = aero.guardAoa;
             float targetAoa = Mathf.Min(targetBladeAoa, maxBladeAoa - 0.5f);
 
             if (guardAoa >= maxBladeAoa)
             {
-                // Stall protection has priority over RPM control. If pitch is already too high for the measured flow,
-                // move toward fine pitch immediately, even if RPM is above target.
+                // Signed high-positive AoA means coarse-pitch stall risk. Move toward fine pitch.
+                // Negative AoA no longer triggers this path; negative thrust is handled above.
                 float severity = Mathf.Clamp01((guardAoa - maxBladeAoa) / 8f + 0.35f);
                 requestedPitchRate = Mathf.Min(requestedPitchRate, -Mathf.Abs(aoaRecoveryRate) * severity);
                 integralError = 0f;
@@ -440,7 +555,7 @@ namespace ConstantSpeedProp
 
             if (guardAoa >= targetAoa && requestedPitchRate > aoaPitchIncreaseLimit)
             {
-                // Near stall region: keep RPM authority, but do not let overspeed spikes command an instant coarse-pitch jump.
+                // Near positive-AoA stall region: keep RPM authority, but avoid instant coarse-pitch jumps.
                 requestedPitchRate = Mathf.Min(requestedPitchRate, Mathf.Max(0f, aoaPitchIncreaseLimit));
                 integralError = Mathf.Min(integralError, 0f);
             }
@@ -455,6 +570,81 @@ namespace ConstantSpeedProp
             return Mathf.Lerp(Mathf.Max(0f, idleRpm), Mathf.Max(0f, targetRpm), Mathf.Clamp01(throttle));
         }
 
+        private float GetCurrentRotorRpm()
+        {
+            float rpm = 0f;
+            try
+            {
+                if (rotor != null)
+                    rpm = Mathf.Abs(rotor.currentRPM);
+            }
+            catch (Exception)
+            {
+                rpm = 0f;
+            }
+
+            // Some Breaking Ground robotics setups leave currentRPM at zero until the PAW/UI has refreshed.
+            // In that case estimate RPM from blade point velocity so the governor can start immediately.
+            if (rpm > 0.25f)
+                return rpm;
+
+            if (TryEstimateRotorRpmFromBladeMotion(out float estimatedRpm))
+                return estimatedRpm;
+
+            return rpm;
+        }
+
+        private bool TryEstimateRotorRpmFromBladeMotion(out float rpm)
+        {
+            rpm = 0f;
+            if (rotor == null || part == null || part.Rigidbody == null || blades.Count == 0)
+                return false;
+
+            try
+            {
+                Vector3 axis = RotorAxis;
+                if (axis.sqrMagnitude < 0.1f)
+                    return false;
+
+                Vector3 origin = rotor.transform.position;
+                Vector3 hubVelocity = part.Rigidbody.GetPointVelocity(origin);
+                float rpmSum = 0f;
+                int samples = 0;
+
+                foreach (ModuleControlSurface blade in blades)
+                {
+                    if (blade == null || blade.part == null || blade.part.Rigidbody == null)
+                        continue;
+
+                    Vector3 refPoint = GetSurfaceReferencePoint(blade);
+                    Vector3 radiusVector = Vector3.ProjectOnPlane(refPoint - origin, axis);
+                    float radius = radiusVector.magnitude;
+                    if (radius < 0.05f)
+                        continue;
+
+                    Vector3 relativeVelocity = blade.part.Rigidbody.GetPointVelocity(refPoint) - hubVelocity;
+                    float tangentialSpeed = Vector3.ProjectOnPlane(relativeVelocity, axis).magnitude;
+                    if (tangentialSpeed < 0.05f)
+                        continue;
+
+                    float omega = tangentialSpeed / radius;
+                    rpmSum += omega * 60f / (2f * Mathf.PI);
+                    samples++;
+                }
+
+                if (samples <= 0)
+                    return false;
+
+                rpm = rpmSum / samples;
+                return rpm > 0.25f;
+            }
+            catch (Exception)
+            {
+                rpm = 0f;
+                return false;
+            }
+        }
+
         private AeroData GetAeroData(float wantedRpm)
         {
             AeroData result = new AeroData
@@ -463,6 +653,10 @@ namespace ConstantSpeedProp
                 signedAverageAoa = 0f,
                 guardAoa = 0f,
                 averageBladeSpeed = 0f,
+                hasForwardLift = false,
+                averageForwardLift = 0f,
+                minForwardLift = 0f,
+                forwardLiftSampleCount = 0,
                 sampleCount = 0,
                 source = "None"
             };
@@ -477,25 +671,46 @@ namespace ConstantSpeedProp
                 float speedSum = 0f;
                 int samples = 0;
 
+                float liftSum = 0f;
+                float minLift = float.MaxValue;
+                int liftSamples = 0;
+
                 foreach (ModuleControlSurface blade in blades)
                 {
+                    if (TryReadForwardLiftKn(blade, out float forwardLift))
+                    {
+                        liftSum += forwardLift;
+                        minLift = Mathf.Min(minLift, forwardLift);
+                        liftSamples++;
+                    }
+
                     if (TryMeasureBladeAero(blade, out BladeAeroSample sample))
                     {
                         signedSum += sample.signedAoa;
+                        // v3.9: no absolute AoA guard. Signed AoA is used only for positive high-AoA stall recovery.
+                        // Negative/reverse-thrust conditions are handled by Forward Lift Guard instead.
                         maxGuard = Mathf.Max(maxGuard, sample.guardAoa);
                         speedSum += sample.bladeSpeed;
                         samples++;
                     }
                 }
 
-                if (samples > 0)
+                if (liftSamples > 0)
                 {
-                    result.valid = true;
-                    result.signedAverageAoa = signedSum / samples;
-                    result.guardAoa = maxGuard;
-                    result.averageBladeSpeed = speedSum / samples;
+                    result.hasForwardLift = true;
+                    result.averageForwardLift = liftSum / liftSamples;
+                    result.minForwardLift = minLift;
+                    result.forwardLiftSampleCount = liftSamples;
+                }
+
+                if (samples > 0 || liftSamples > 0)
+                {
+                    result.valid = samples > 0;
+                    result.signedAverageAoa = samples > 0 ? signedSum / samples : 0f;
+                    result.guardAoa = samples > 0 ? maxGuard : 0f;
+                    result.averageBladeSpeed = samples > 0 ? speedSum / samples : 0f;
                     result.sampleCount = samples;
-                    result.source = "DLC Measured";
+                    result.source = samples > 0 ? "DLC Measured" : "DLC Lift Only";
                     return result;
                 }
             }
@@ -509,7 +724,7 @@ namespace ConstantSpeedProp
             float signedAoa = collectivePitch - helixAngle;
             result.valid = true;
             result.signedAverageAoa = signedAoa;
-            result.guardAoa = useAbsoluteAoaLimit ? Mathf.Abs(signedAoa) : signedAoa;
+            result.guardAoa = signedAoa;
             result.averageBladeSpeed = 0f;
             result.sampleCount = 0;
             result.source = "Fallback";
@@ -523,7 +738,9 @@ namespace ConstantSpeedProp
                 valid = false,
                 signedAoa = 0f,
                 guardAoa = 0f,
-                bladeSpeed = 0f
+                bladeSpeed = 0f,
+                hasForwardLift = false,
+                forwardLift = 0f
             };
 
             if (blade == null || !blade.deploy || blade.part == null || part == null || rotor == null)
@@ -570,12 +787,154 @@ namespace ConstantSpeedProp
 
                 sample.valid = true;
                 sample.signedAoa = signedAoa;
-                sample.guardAoa = useAbsoluteAoaLimit ? Mathf.Abs(signedAoa) : signedAoa;
+                sample.guardAoa = signedAoa;
                 sample.bladeSpeed = speed;
                 return true;
             }
             catch (Exception)
             {
+                return false;
+            }
+        }
+
+        private bool TryReadForwardLiftKn(ModuleControlSurface blade, out float liftKn)
+        {
+            liftKn = 0f;
+            if (blade == null || blade.part == null)
+                return false;
+
+            try
+            {
+                foreach (PartModule module in blade.part.Modules)
+                {
+                    if (module == null || module.Fields == null)
+                        continue;
+
+                    foreach (BaseField field in module.Fields)
+                    {
+                        if (field == null)
+                            continue;
+
+                        if (!LooksLikeForwardLiftField(field))
+                            continue;
+
+                        if (TryGetFieldFloat(module, field, out liftKn))
+                            return true;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                liftKn = 0f;
+            }
+
+            return false;
+        }
+
+        private bool LooksLikeForwardLiftField(BaseField field)
+        {
+            string gui = string.Empty;
+            string internalName = string.Empty;
+
+            try { gui = field.guiName ?? string.Empty; } catch (Exception) { gui = string.Empty; }
+            try
+            {
+                object value = field.GetType().GetProperty("name") != null
+                    ? field.GetType().GetProperty("name").GetValue(field, null)
+                    : null;
+                internalName = value != null ? value.ToString() : string.Empty;
+            }
+            catch (Exception)
+            {
+                internalName = string.Empty;
+            }
+
+            string text = (gui + " " + internalName).ToLowerInvariant();
+            if (text.Contains("vertical") || text.Contains("垂直"))
+                return false;
+
+            if (text.Contains("前进升力") || text.Contains("前向升力") || text.Contains("推进升力"))
+                return true;
+
+            if (text.Contains("forward") && text.Contains("lift"))
+                return true;
+
+            // Some localized KSP builds use only a lift label on the propeller blade module.
+            // Be conservative: do not match generic lift unless forward/前进 is present.
+            return false;
+        }
+
+        private bool TryGetFieldFloat(PartModule module, BaseField field, out float value)
+        {
+            value = 0f;
+            try
+            {
+                object raw = field.GetValue(module);
+                if (TryConvertToFloat(raw, out value))
+                    return true;
+            }
+            catch (Exception)
+            {
+                // Fall back to GUI string below.
+            }
+
+            try
+            {
+                string guiString = field.GetStringValue(module, true);
+                if (TryConvertToFloat(guiString, out value))
+                    return true;
+            }
+            catch (Exception)
+            {
+                value = 0f;
+            }
+
+            return false;
+        }
+
+        private bool TryConvertToFloat(object raw, out float value)
+        {
+            value = 0f;
+            if (raw == null)
+                return false;
+
+            try
+            {
+                if (raw is float f)
+                {
+                    value = f;
+                    return true;
+                }
+                if (raw is double d)
+                {
+                    value = (float)d;
+                    return true;
+                }
+                if (raw is int i)
+                {
+                    value = i;
+                    return true;
+                }
+                if (raw is long l)
+                {
+                    value = l;
+                    return true;
+                }
+
+                string text = raw.ToString();
+                if (string.IsNullOrEmpty(text))
+                    return false;
+
+                Match match = Regex.Match(text, @"[-+]?\d+(?:[\.,]\d+)?");
+                if (!match.Success)
+                    return false;
+
+                string number = match.Value.Replace(',', '.');
+                return float.TryParse(number, NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+            }
+            catch (Exception)
+            {
+                value = 0f;
                 return false;
             }
         }
@@ -641,11 +1000,27 @@ namespace ConstantSpeedProp
         private void RefreshBlades()
         {
             blades.Clear();
+            if (part == null || part.children == null)
+            {
+                bladeCountDisplay = 0;
+                return;
+            }
+
             foreach (Part child in part.children)
             {
+                if (child == null)
+                    continue;
+
                 ModuleControlSurface surface = child.FindModuleImplementing<ModuleControlSurface>();
                 if (surface != null)
+                {
+                    // v3.7: Do this during refresh as well as during apply, so the blades are ready
+                    // even before their PAW has ever been opened.
+                    if (governorEnabled && !surface.deploy)
+                        surface.deploy = true;
+
                     blades.Add(surface);
+                }
             }
 
             bladeCountDisplay = blades.Count;
